@@ -12,25 +12,53 @@ function panicAbort($msg) {
     exit(-1);
 }
 
+function logMessage($ident, $msg, $boo_raw = false, $only_file = false) {
+    $dt = date("d-m-Y h:i:s");
+    $pid = posix_getpid();
+    $prefix = "[$dt $ident:$pid]";
 
+    $msg = "$prefix $msg";
+
+    if (!$only_file) {
+        $sanitized = str_replace("\r", "", $msg);
+
+        $obj_r = getLocalCon(true);
+        $obj_r->multi();
+        $obj_r->rPush($ident, $sanitized);
+        $obj_r->rPush('global', $sanitized);
+        $obj_r->exec();
+    }
+
+    if ( ! $boo_raw) $msg .= "\n";
+
+    echo $msg;
+}
+
+function logRawMessage($ident, $msg) {
+    logMessage($ident, $msg, true);
+}
 
 function getCon($host, $port, $auth) {
     $obj_r = new Redis();
 
-    if ($auth) {
-        $obj_r->connect($host, $port, 1, null, 0, 0, ['auth' => $auth]);
-    } else {
-        $obj_r->connect($host, $port, 1, null, 0, 0);
-    }
-
-    if ( ! $obj_r->isConnected()) {
-        if ($obj_r->getLastError()) {
-            echo "Redis Error:  {$obj_r->getLastError()}\n";
+    try {
+        if ($auth) {
+            $obj_r->connect($host, $port, 1, null, 0, 0, ['auth' => $auth]);
+        } else {
+            $obj_r->connect($host, $port, 1, null, 0, 0);
         }
-        panicAbort("Can't connect to Redis at $host:$port");
-    }
 
-    return $obj_r;
+        if ( ! $obj_r->isConnected()) {
+            if ($obj_r->getLastError()) {
+                echo "Redis Error:  {$obj_r->getLastError()}\n";
+            }
+            panicAbort("Can't connect to Redis at $host:$port");
+        }
+
+        return $obj_r;
+    } catch (Exception $ex) {
+        panicAbort("Can't connect to Redis (exception: {$ex->getMessage()}");
+    }
 }
 
 function getConObj($opt) {
@@ -38,6 +66,23 @@ function getConObj($opt) {
         panicAbort("Must pass an Options or HostInfo object");
 
     return getCon($opt->_host, $opt->_port, $opt->_auth);
+}
+
+function getLocalCon($boo_cached = false) {
+    static $_obj_local = NULL;
+    if ($_obj_local === NULL) {
+        $_obj_local = getCon('localhost', 6379, NULL);
+    }
+
+    return $boo_cached ? $_obj_local : getCon('localhost', 6379, NULL);
+}
+
+function nextUniqueId() {
+    static $_obj_local = NULL;
+    if ($_obj_local === NULL)
+        $_obj_local = getLocalCon();
+
+    return $_obj_local->incr("NEXT_UNIQUE_ID");
 }
 
 class HostInfo {
@@ -91,10 +136,11 @@ class Options {
     public $_mode;
     public $_replica;
     public $_discard_failures;
+    public $_debug;
 
     public function __construct($obj_info, $chan, $mode, $replica, $sleep_min, $sleep_max,
                                 $min_cmds, $max_cmds, $sets, $fields, $delay,
-                                $retry, $discard)
+                                $retry, $discard, $debug)
     {
         $this->_host = $obj_info->_host;
         $this->_port = $obj_info->_port;
@@ -111,6 +157,7 @@ class Options {
         $this->_mode = $mode;
         $this->_replica = $replica;
         $this->_discard_failures = $discard;
+        $this->_debug = $debug;
     }
 
     public function sleep_us() {
@@ -137,28 +184,46 @@ class Options {
 
     public static function sleepWithUpdate($usec, $tick_usec = 100000) {
         $last_remaining = NULL;
+        $keypress = false;
 
         while ($usec > 0) {
             $remaining = gmdate("H:i:s", round($usec / 1000000));
 
             if ($remaining != $last_remaining) {
-                echo "Sleeping " . str_pad($remaining, 10, ' ', STR_PAD_LEFT) . " (press return to exit early)\r";
+                logRawMessage("producer", "Sleeping " . str_pad($remaining, 10, ' ', STR_PAD_LEFT) . " (press return to exit early)\r", true);
             }
 
             $n = $usec > $tick_usec ? $tick_usec : $usec;
             if (self::waitForKey($n)) {
-                echo "Detected keypress, exiting early";
+                $keypress = true;
                 break;
             }
 
             $usec -= $n;
             $last_remaining = $remaining;
         }
-        echo "\n";
+        if ( ! $keypress)
+            echo "\n";
     }
 
     public function sleep_update() {
-        self::sleepWithUpdate($this->sleep_us(), 100000, '/tmp/go');
+        if (stream_isatty(STDIN) && stream_isatty(STDOUT)) {
+            self::sleepWithUpdate($this->sleep_us(), 100000);
+        } else {
+            $obj_r = getLocalCon(true);
+            $usec = $this->sleep_us();
+            $pid = getmypid();
+
+            while ($usec > 0) {
+                $remaining = gmdate("H:i:s", round($usec / 1000000));
+                $obj_r->hset('countdown', $pid, $remaining);
+                $n = $usec > 1000000 ? 1000000 : $usec;
+                usleep($n);
+                $usec -= $n;
+            }
+
+            $obj_r->hDel('countdown', $pid);
+        }
     }
 
     public function payload() {
@@ -172,8 +237,9 @@ class Options {
         return $a;
     }
 
-   public function getNextJob($id) {
+   public function getNextJob($id = NULL) {
        $i_cmds = rand($this->_min_cmds, $this->_max_cmds);
+       if ( ! $id) $id = nextUniqueId();
        return new MockJob($id, $this->_replica, $i_cmds, $this->_sets, $this->_fields);
    }
 
@@ -245,7 +311,7 @@ function printUsage() {
 function getOptions() {
     $opt = getopt('h', ['instance:', 'host:', 'port:', 'auth:', 'channel:',
                   'sleep:', 'sets:', 'fields:', 'delay:', 'retry:',
-                  'commands:', 'mode:', 'discard', 'help']);
+                  'commands:', 'mode:', 'discard', 'debug', 'help']);
 
     if (isset($opt['h']) || isset($opt['help']))
         printUsage();
@@ -263,6 +329,7 @@ function getOptions() {
     $retry = $opt['retry'] ?? 30;
     $mode = $opt['mode'] ?? 'atomic';
     $discard = isset($opt['discard']);
+    $debug = isset($opt['debug']);
 
     MockJob::validateMode($mode);
 
@@ -290,5 +357,5 @@ function getOptions() {
     $replica = $info['role'] != 'master';
 
     return new Options($obj_info, $chan, $mode, $replica, $sleep_min, $sleep_max, $cmd_min, $cmd_max,
-                       $sets, $fields, $delay, $retry, $discard);
+                       $sets, $fields, $delay, $retry, $discard, $debug);
 }

@@ -7,14 +7,14 @@ require_once(__DIR__ . '/job.php');
 use Pheanstalk\Pheanstalk;
 
 $obj_opt = getOptions();
-$i_seq = 1;
 $str_type = $obj_opt->_replica ? 'replica' : 'primary';
 
 $pheanstalk = Pheanstalk::create('127.0.0.1');
 
 do {
-    $obj_job = $obj_opt->getNextJob($i_seq);
-    echo "[$i_seq]: {$obj_opt->_chan}, type: $str_type => {$obj_job->getCommandCount()} commands\n";
+    $obj_job = $obj_opt->getNextJob();
+    $id = $obj_job->id();
+    logMessage("producer", "{id: $id, channel: {$obj_opt->_chan}, type: $str_type, commands: {$obj_job->getCommandCount()}");
 
     $pheanstalk
         ->useTube($obj_opt->_chan)
@@ -26,5 +26,4 @@ do {
          );
 
     $obj_opt->sleep_update();
-    $i_seq++;
 } while (true);

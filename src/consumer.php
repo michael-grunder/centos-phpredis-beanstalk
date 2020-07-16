@@ -9,9 +9,10 @@ $obj_r = getConObj($obj_opt);
 $primary = isPrimary($obj_r);
 $mode = $obj_opt->_mode;
 
-echo "Listening to job queue: {$obj_opt->_chan}\n";
-echo "Redis: " . $obj_r->getHost() . ':' . $obj_r->getPort() . "\n";
-echo "Exec Mode: $mode\n";
+$host = $obj_r->getHost();
+$port = $obj_r->getPort();
+
+logMessage("consumer", "{Redis: '$host:$port', mode: $mode}");
 
 $pheanstalk = Pheanstalk::create('127.0.0.1');
 
@@ -23,9 +24,14 @@ while (true) {
     $job = $pheanstalk->reserve();
 
     try {
-        $obj_job = @unserialize($job->getData());
+        $data = $job->getData();
+        $obj_job = @unserialize($data);
         if ( ! ($obj_job InstanceOf MockJob)) {
-            echo "Malformed payload, skipping...";
+            logMessage("consumer", "Malformed payload, skipping...");
+            if ($obj_opt->_debug);
+                logMessage("consumer", serialize($data));
+            if ($obj_opt->_discard_failures)
+                $pheanstalk->delete($job);
             continue;
         }
 
@@ -44,12 +50,12 @@ while (true) {
         }
         $str_disp = implode(', ', $arr_disp);
 
-        echo "[$id] - {$delay}s ago, $ccount cmds, {$msec}ms => [$mode; $str_disp]\n";
+        logMessage("consumer", "{id: $id, delay: {$delay}, commands: $ccount cmds, mstime: {$msec}} [$mode; $str_disp]");
 
         $pheanstalk->delete($job);
     }
     catch(\Exception $e) {
-        echo "[$id]: Exception: " . $e->getMessage() . "\n";
+        logMessage("consumer", "{id: $id, Exception: {$e->getMessage()}}");
         if ($obj_opt->_discard_failures) {
             $pheanstalk->delete($job);
         } else {
